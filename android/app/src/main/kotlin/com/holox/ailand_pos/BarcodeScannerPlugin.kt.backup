@@ -1,0 +1,588 @@
+package com.holox.ailand_pos
+
+import android.app.PendingIntent
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.hardware.usb.UsbDevice
+import android.hardware.usb.UsbManager
+import android.os.Build
+import android.util.Log
+import android.view.KeyEvent
+import io.flutter.embedding.engine.plugins.FlutterPlugin
+import io.flutter.plugin.common.MethodCall
+import io.flutter.plugin.common.MethodChannel
+import io.flutter.plugin.common.MethodChannel.MethodCallHandler
+import io.flutter.plugin.common.MethodChannel.Result
+import java.util.concurrent.ConcurrentLinkedQueue
+
+/**
+ * 条码扫描器插件
+ * 支持USB HID模式的条码扫描器（如得力No.14952W）
+ * 原理：扫描器模拟USB键盘，监听键盘输入事件获取条码数据
+ */
+class BarcodeScannerPlugin : FlutterPlugin, MethodCallHandler {
+    private lateinit var channel: MethodChannel
+    private var context: Context? = null
+    private var usbManager: UsbManager? = null
+    
+    // 扫码数据缓冲区
+    private val scanBuffer = StringBuilder()
+    private var lastKeyTime: Long = 0
+    private val scanTimeout = 100L // 扫码间隔超时（毫秒）
+    
+    // 是否正在监听扫码
+    private var isListening = false
+    
+    companion object {
+        private const val TAG = "BarcodeScanner"
+        private const val CHANNEL_NAME = "com.holox.ailand_pos/barcode_scanner"
+        private const val ACTION_USB_PERMISSION = "com.holox.ailand_pos.USB_BARCODE_SCANNER_PERMISSION"
+        
+        // ========== USB HID 协议标准常量 ==========
+        // USB设备类
+        private const val USB_CLASS_HID = 3  // Human Interface Device
+        
+        // USB HID 子类定义（Subclass）
+        private const val USB_SUBCLASS_NONE = 0      // 无子类（扫描器常用）
+        private const val USB_SUBCLASS_BOOT = 1      // Boot Interface（键盘/鼠标）
+        
+        // USB HID 协议定义（Protocol）
+        private const val USB_PROTOCOL_NONE = 0      // 厂商自定义协议（扫描器）
+        private const val USB_PROTOCOL_KEYBOARD = 1  // 标准键盘协议
+        private const val USB_PROTOCOL_MOUSE = 2     // 标准鼠标协议
+        
+        /**
+         * 扫描器厂商ID白名单（仅作辅助验证，非主要判断依据）
+         * 包括得力、霍尼韦尔、斑马、讯宝等主流品牌
+         */
+        private val KNOWN_SCANNER_VENDORS = listOf(
+            // 得力（Deli）
+            0x05e0,  // Symbol Technologies (Zebra收购)
+            0x0c2e,  // Honeywell (霍尼韦尔)
+            0x0536,  // Hand Held Products (Honeywell旗下)
+            0x1f3a,  // Allwinner Technology (全志科技，部分扫描器使用)
+            0x1a86,  // QinHeng Electronics (沁恒电子，CH340芯片)
+            0x0483,  // STMicroelectronics (意法半导体)
+            0x1a40,  // Terminus Technology (泰硕电子，USB Hub常用)
+            0x2687,  // Fitbit (某些扫描器使用相同芯片)
+            0x05ac,  // Apple (部分扫描器兼容)
+            // 通用USB HID设备
+            0x04d9,  // Holtek Semiconductor (合泰半导体)
+            0x046d,  // Logitech (罗技，部分扫描枪)
+            0x062a,  // MosArt Semiconductor (部分扫描器)
+            0x258a,  // SINO WEALTH (中颖电子)
+            0x04b4,  // Cypress Semiconductor (赛普拉斯)
+        )
+    }
+    
+    // USB权限接收器
+    private val usbReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            when (intent.action) {
+                ACTION_USB_PERMISSION -> {
+                    synchronized(this) {
+                        val device: UsbDevice? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                            intent.getParcelableExtra(UsbManager.EXTRA_DEVICE, UsbDevice::class.java)
+                        } else {
+                            @Suppress("DEPRECATION")
+                            intent.getParcelableExtra(UsbManager.EXTRA_DEVICE)
+                        }
+                        
+                        if (intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)) {
+                            device?.let {
+                                Log.d(TAG, "USB permission granted for device: ${it.deviceName}")
+                                // 通知Flutter层权限已授予，触发重新扫描
+                                channel.invokeMethod("onPermissionGranted", mapOf(
+                                    "deviceId" to it.deviceName,
+                                    "deviceName" to (it.productName ?: it.deviceName)
+                                ))
+                            }
+                        } else {
+                            Log.d(TAG, "USB permission denied for device: ${device?.deviceName}")
+                            // 通知Flutter层权限被拒绝
+                            channel.invokeMethod("onPermissionDenied", mapOf(
+                                "deviceId" to device?.deviceName
+                            ))
+                        }
+                    }
+                }
+                UsbManager.ACTION_USB_DEVICE_ATTACHED -> {
+                    val device: UsbDevice? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        intent.getParcelableExtra(UsbManager.EXTRA_DEVICE, UsbDevice::class.java)
+                    } else {
+                        @Suppress("DEPRECATION")
+                        intent.getParcelableExtra(UsbManager.EXTRA_DEVICE)
+                    }
+                    Log.d(TAG, "USB device attached: ${device?.deviceName}")
+                    channel.invokeMethod("onDeviceAttached", null)
+                }
+                UsbManager.ACTION_USB_DEVICE_DETACHED -> {
+                    val device: UsbDevice? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        intent.getParcelableExtra(UsbManager.EXTRA_DEVICE, UsbDevice::class.java)
+                    } else {
+                        @Suppress("DEPRECATION")
+                        intent.getParcelableExtra(UsbManager.EXTRA_DEVICE)
+                    }
+                    Log.d(TAG, "USB device detached: ${device?.deviceName}")
+                    channel.invokeMethod("onDeviceDetached", null)
+                }
+            }
+        }
+    }
+    
+    override fun onAttachedToEngine(flutterPluginBinding: FlutterPlugin.FlutterPluginBinding) {
+        channel = MethodChannel(flutterPluginBinding.binaryMessenger, CHANNEL_NAME)
+        channel.setMethodCallHandler(this)
+        context = flutterPluginBinding.applicationContext
+        usbManager = context?.getSystemService(Context.USB_SERVICE) as? UsbManager
+        
+        // 注册USB广播接收器
+        val filter = IntentFilter().apply {
+            addAction(ACTION_USB_PERMISSION)
+            addAction(UsbManager.ACTION_USB_DEVICE_ATTACHED)
+            addAction(UsbManager.ACTION_USB_DEVICE_DETACHED)
+        }
+        
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            context?.registerReceiver(usbReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            context?.registerReceiver(usbReceiver, filter)
+        }
+        
+        Log.d(TAG, "BarcodeScannerPlugin attached")
+    }
+    
+    override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
+        channel.setMethodCallHandler(null)
+        
+        try {
+            context?.unregisterReceiver(usbReceiver)
+        } catch (e: Exception) {
+            Log.e(TAG, "Error unregistering receiver: ${e.message}")
+        }
+        
+        context = null
+        usbManager = null
+        Log.d(TAG, "BarcodeScannerPlugin detached")
+    }
+    
+    override fun onMethodCall(call: MethodCall, result: Result) {
+        when (call.method) {
+            "scanUsbScanners" -> scanUsbScanners(result)
+            "requestPermission" -> requestPermission(call, result)
+            "startListening" -> startListening(call, result)
+            "stopListening" -> stopListening(result)
+            "handleKeyEvent" -> handleKeyEvent(call, result)
+            else -> result.notImplemented()
+        }
+    }
+    
+    /**
+     * 扫描USB条码扫描器设备
+     */
+    private fun scanUsbScanners(result: Result) {
+        try {
+            val deviceList = usbManager?.deviceList ?: emptyMap()
+            Log.d(TAG, "========== 开始扫描USB扫描器 ==========")
+            Log.d(TAG, "检测到 ${deviceList.size} 个USB设备")
+            
+            // 打印所有USB设备信息
+            deviceList.values.forEachIndexed { index, device ->
+                Log.d(TAG, "设备 ${index + 1}:")
+                Log.d(TAG, "  名称: ${device.deviceName}")
+                Log.d(TAG, "  厂商ID: 0x${device.vendorId.toString(16)}")
+                Log.d(TAG, "  产品ID: 0x${device.productId.toString(16)}")
+                Log.d(TAG, "  设备类: ${device.deviceClass}")
+                Log.d(TAG, "  接口数: ${device.interfaceCount}")
+            }
+            
+            val scanners = deviceList.values
+                .filter { device ->
+                    val isScanner = isScannerDevice(device)
+                    if (isScanner) {
+                        Log.d(TAG, "✓ 识别为扫描器: ${device.deviceName}")
+                    }
+                    isScanner
+                }
+                .map { device ->
+                    val hasPermission = usbManager?.hasPermission(device) == true
+                    val deviceInfo = getDeviceInfo(device)
+                    
+                    hashMapOf(
+                        "deviceId" to device.deviceId.toString(),
+                        "deviceName" to (deviceInfo["model"] ?: "Barcode Scanner"),
+                        "manufacturer" to deviceInfo["manufacturer"],
+                        "productName" to (deviceInfo["model"] ?: "Barcode Scanner"),
+                        "model" to deviceInfo["model"],
+                        "specifications" to deviceInfo["specifications"],
+                        "vendorId" to device.vendorId,
+                        "productId" to device.productId,
+                        "isConnected" to hasPermission,
+                        "serialNumber" to device.serialNumber,
+                        "usbPath" to device.deviceName
+                    )
+                }
+            
+            Log.d(TAG, "========== 扫描完成，找到 ${scanners.size} 个扫描器 ==========")
+            result.success(scanners)
+        } catch (e: Exception) {
+            Log.e(TAG, "Error scanning USB devices: ${e.message}", e)
+            result.error("SCAN_ERROR", "Failed to scan USB devices: ${e.message}", null)
+        }
+    }
+    
+    /**
+     * 判断是否为条码扫描器设备
+     */
+    private fun isScannerDevice(device: UsbDevice): Boolean {
+        // 方法1: 检查接口类（HID设备）
+        for (i in 0 until device.interfaceCount) {
+            val usbInterface = device.getInterface(i)
+            // HID接口 + 已知厂商
+            if (usbInterface.interfaceClass == USB_CLASS_HID && 
+                device.vendorId in KNOWN_SCANNER_VENDORS) {
+                Log.d(TAG, "Device ${device.deviceName} is a HID scanner (vendor: 0x${device.vendorId.toString(16)})")
+                return true
+            }
+            // 任何HID接口都可能是扫描器（宽松匹配）
+            if (usbInterface.interfaceClass == USB_CLASS_HID) {
+                Log.d(TAG, "Device ${device.deviceName} is a HID device, likely a scanner")
+                return true
+            }
+        }
+        
+        // 方法2: 检查已知厂商ID
+        if (device.vendorId in KNOWN_SCANNER_VENDORS) {
+            Log.d(TAG, "Device ${device.deviceName} is from known scanner vendor: 0x${device.vendorId.toString(16)}")
+            return true
+        }
+        
+        // 方法3: 通过产品名称关键词判断
+        val productName = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+            device.productName?.lowercase() ?: ""
+        } else {
+            ""
+        }
+        val scannerKeywords = listOf("scanner", "barcode", "qr", "reader", "scan")
+        if (scannerKeywords.any { productName.contains(it) }) {
+            Log.d(TAG, "Device ${device.deviceName} is likely a scanner (by product name)")
+            return true
+        }
+        
+        return false
+    }
+    
+    /**
+     * 获取设备详细信息
+     */
+    private fun getDeviceInfo(device: UsbDevice): Map<String, String?> {
+        val productName = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+            device.productName ?: "Unknown"
+        } else {
+            "Unknown"
+        }
+        
+        val manufacturerName = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+            device.manufacturerName ?: getManufacturerNameByVendorId(device.vendorId)
+        } else {
+            getManufacturerNameByVendorId(device.vendorId)
+        }
+        
+        val info = when (device.vendorId) {
+            0x05e0 -> mapOf(
+                "manufacturer" to "Symbol Technologies (Zebra)",
+                "model" to if (productName != "Unknown") productName else "LS2208",
+                "specifications" to "1D/2D Barcode, USB HID"
+            )
+            0x0c2e -> mapOf(
+                "manufacturer" to "Honeywell",
+                "model" to if (productName != "Unknown") productName else "Voyager 1200g",
+                "specifications" to "1D/2D Barcode, USB HID"
+            )
+            0x0536 -> mapOf(
+                "manufacturer" to "Hand Held Products (Honeywell)",
+                "model" to if (productName != "Unknown") productName else "4600 Series",
+                "specifications" to "1D/2D Barcode, USB HID"
+            )
+            else -> mapOf(
+                "manufacturer" to manufacturerName,
+                "model" to if (productName != "Unknown") productName else "Barcode Scanner",
+                "specifications" to "1D/2D Barcode, USB HID Keyboard Mode"
+            )
+        }
+        
+        return info
+    }
+    
+    /**
+     * 根据厂商ID获取厂商名称
+     */
+    private fun getManufacturerNameByVendorId(vendorId: Int): String {
+        return when (vendorId) {
+            0x05e0 -> "Symbol Technologies (Zebra)"
+            0x0c2e -> "Honeywell"
+            0x0536 -> "Hand Held Products"
+            0x1f3a -> "Allwinner Technology"
+            0x1a86 -> "QinHeng Electronics"
+            0x0483 -> "STMicroelectronics"
+            0x1a40 -> "Terminus Technology"
+            0x04d9 -> "Holtek Semiconductor"
+            0x046d -> "Logitech"
+            0x062a -> "MosArt Semiconductor"
+            0x258a -> "SINO WEALTH"
+            0x04b4 -> "Cypress Semiconductor"
+            else -> "Unknown Manufacturer"
+        }
+    }
+    
+    /**
+     * 请求USB设备权限
+     */
+    private fun requestPermission(call: MethodCall, result: Result) {
+        try {
+            val deviceId = call.argument<String>("deviceId")
+            if (deviceId == null) {
+                result.error("INVALID_ARGUMENT", "Device ID is required", null)
+                return
+            }
+            
+            val device = findDeviceById(deviceId)
+            if (device == null) {
+                result.error("DEVICE_NOT_FOUND", "Device with ID $deviceId not found", null)
+                return
+            }
+            
+            if (usbManager?.hasPermission(device) == true) {
+                result.success(true)
+                return
+            }
+            
+            val permissionIntent = PendingIntent.getBroadcast(
+                context,
+                0,
+                Intent(ACTION_USB_PERMISSION),
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    PendingIntent.FLAG_MUTABLE
+                } else {
+                    0
+                }
+            )
+            
+            usbManager?.requestPermission(device, permissionIntent)
+            result.success(false) // 权限请求已发起，但尚未授予
+        } catch (e: Exception) {
+            Log.e(TAG, "Error requesting permission: ${e.message}", e)
+            result.error("PERMISSION_ERROR", "Failed to request permission: ${e.message}", null)
+        }
+    }
+    
+    /**
+     * 开始监听扫码
+     */
+    private fun startListening(call: MethodCall, result: Result) {
+        try {
+            isListening = true
+            scanBuffer.clear()
+            lastKeyTime = 0
+            Log.d(TAG, "Started listening for barcode input")
+            result.success(true)
+        } catch (e: Exception) {
+            Log.e(TAG, "Error starting listener: ${e.message}", e)
+            result.error("START_ERROR", "Failed to start listening: ${e.message}", null)
+        }
+    }
+    
+    /**
+     * 停止监听扫码
+     */
+    private fun stopListening(result: Result) {
+        try {
+            isListening = false
+            scanBuffer.clear()
+            Log.d(TAG, "Stopped listening for barcode input")
+            result.success(true)
+        } catch (e: Exception) {
+            Log.e(TAG, "Error stopping listener: ${e.message}", e)
+            result.error("STOP_ERROR", "Failed to stop listening: ${e.message}", null)
+        }
+    }
+    
+    /**
+     * 处理键盘事件（从Flutter层调用）
+     */
+    private fun handleKeyEvent(call: MethodCall, result: Result) {
+        try {
+            if (!isListening) {
+                result.success(false)
+                return
+            }
+            
+            val keyCode = call.argument<Int>("keyCode") ?: 0
+            val action = call.argument<Int>("action") ?: 0
+            
+            // 只处理按键按下事件
+            if (action != KeyEvent.ACTION_DOWN) {
+                result.success(false)
+                return
+            }
+            
+            val currentTime = System.currentTimeMillis()
+            
+            // 检查超时（新的扫码开始）
+            if (lastKeyTime > 0 && (currentTime - lastKeyTime) > scanTimeout) {
+                if (scanBuffer.isNotEmpty()) {
+                    // 处理上一次的扫码数据
+                    processScanData()
+                }
+                scanBuffer.clear()
+            }
+            
+            lastKeyTime = currentTime
+            
+            // 处理按键
+            when (keyCode) {
+                KeyEvent.KEYCODE_ENTER -> {
+                    // 回车键表示扫码结束
+                    if (scanBuffer.isNotEmpty()) {
+                        processScanData()
+                        scanBuffer.clear()
+                    }
+                }
+                else -> {
+                    // 添加字符到缓冲区
+                    val char = getCharFromKeyCode(keyCode)
+                    if (char != null) {
+                        scanBuffer.append(char)
+                    }
+                }
+            }
+            
+            result.success(true)
+        } catch (e: Exception) {
+            Log.e(TAG, "Error handling key event: ${e.message}", e)
+            result.error("KEY_EVENT_ERROR", "Failed to handle key event: ${e.message}", null)
+        }
+    }
+    
+    /**
+     * 处理扫码数据
+     */
+    private fun processScanData() {
+        val barcodeData = scanBuffer.toString().trim()
+        if (barcodeData.isEmpty()) return
+        
+        Log.d(TAG, "Barcode scanned: $barcodeData")
+        
+        // 识别条码类型
+        val barcodeType = recognizeBarcodeType(barcodeData)
+        
+        val scanResult = hashMapOf(
+            "type" to barcodeType,
+            "content" to barcodeData,
+            "length" to barcodeData.length,
+            "timestamp" to java.time.Instant.now().toString(),
+            "isValid" to true,
+            "rawData" to barcodeData
+        )
+        
+        channel.invokeMethod("onScanResult", scanResult)
+    }
+    
+    /**
+     * 识别条码类型
+     */
+    private fun recognizeBarcodeType(data: String): String {
+        return when {
+            data.length == 13 && data.all { it.isDigit() } -> "EAN-13"
+            data.length == 8 && data.all { it.isDigit() } -> "EAN-8"
+            data.length == 12 && data.all { it.isDigit() } -> "UPC-A"
+            data.startsWith("http://") || data.startsWith("https://") -> "QR Code (URL)"
+            data.contains(":") || data.contains(";") -> "QR Code"
+            data.all { it.isDigit() } -> "Numeric Barcode"
+            else -> "Code 128 / Code 39"
+        }
+    }
+    
+    /**
+     * 直接处理键盘事件（从MainActivity调用）
+     * 返回true表示事件已处理，false表示需要系统继续处理
+     */
+    fun handleKeyEventDirect(event: KeyEvent): Boolean {
+        // 只处理按键按下事件
+        if (event.action != KeyEvent.ACTION_DOWN) {
+            return false
+        }
+        
+        // 如果未在监听状态，不拦截事件
+        if (!isListening) {
+            return false
+        }
+        
+        val currentTime = System.currentTimeMillis()
+        
+        // 检查超时（新的扫码开始）
+        if (lastKeyTime > 0 && (currentTime - lastKeyTime) > scanTimeout) {
+            if (scanBuffer.isNotEmpty()) {
+                // 处理上一次的扫码数据
+                processScanData()
+            }
+            scanBuffer.clear()
+        }
+        
+        lastKeyTime = currentTime
+        
+        // 处理按键
+        when (event.keyCode) {
+            KeyEvent.KEYCODE_ENTER -> {
+                // 回车键表示扫码结束
+                if (scanBuffer.isNotEmpty()) {
+                    processScanData()
+                    scanBuffer.clear()
+                }
+                return true  // 拦截回车键
+            }
+            else -> {
+                // 尝试获取字符
+                val char = getCharFromKeyCode(event.keyCode)
+                if (char != null) {
+                    scanBuffer.append(char)
+                    Log.d(TAG, "Key captured: ${event.keyCode} -> '$char', buffer: $scanBuffer")
+                    return true  // 拦截已识别的字符键
+                }
+            }
+        }
+        
+        // 未识别的按键，让系统继续处理
+        return false
+    }
+    
+    /**
+     * 从键码获取字符
+     */
+    private fun getCharFromKeyCode(keyCode: Int): Char? {
+        return when (keyCode) {
+            in KeyEvent.KEYCODE_0..KeyEvent.KEYCODE_9 -> 
+                ('0'.code + (keyCode - KeyEvent.KEYCODE_0)).toChar()
+            in KeyEvent.KEYCODE_A..KeyEvent.KEYCODE_Z -> 
+                ('a'.code + (keyCode - KeyEvent.KEYCODE_A)).toChar()
+            KeyEvent.KEYCODE_SPACE -> ' '
+            KeyEvent.KEYCODE_MINUS -> '-'
+            KeyEvent.KEYCODE_EQUALS -> '='
+            KeyEvent.KEYCODE_PERIOD -> '.'
+            KeyEvent.KEYCODE_COMMA -> ','
+            KeyEvent.KEYCODE_SLASH -> '/'
+            KeyEvent.KEYCODE_BACKSLASH -> '\\'
+            else -> null
+        }
+    }
+    
+    /**
+     * 根据设备ID查找设备
+     */
+    private fun findDeviceById(deviceId: String): UsbDevice? {
+        val deviceList = usbManager?.deviceList ?: return null
+        return deviceList.values.find { it.deviceId.toString() == deviceId }
+    }
+}
