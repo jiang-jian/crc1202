@@ -2,9 +2,30 @@ import 'dart:async';
 import 'package:flutter/services.dart';
 import '../models/scanner_box_model.dart';
 
-/// 扫码盒子硬件插件
+/// ⚠️ 【已废弃 - DEPRECATED】
+/// 
+/// 此文件已不再使用！
+/// 
+/// 原因：
+/// 此插件与 BarcodeScannerService 共用同一个 MethodChannel，
+/// 导致 setMethodCallHandler 互相覆盖，造成设备冲突。
+/// 
+/// 修复方案：
+/// ScannerBoxService 已改为直接依赖 BarcodeScannerService，
+/// 通过事件监听机制共享扫描结果，无需独立的插件层。
+/// 
+/// 参考：lib/data/services/scanner_box_service.dart
+/// 
+/// 保留此文件仅用于代码历史参考，后续可删除。
+/// 
+/// @deprecated 请使用 BarcodeScannerService 替代
+/// 
+/// 扫码盒子硬件插件（已废弃）
 /// 桥接Android原生BarcodeScannerPlugin
+@Deprecated('使用 BarcodeScannerService 替代，避免 MethodChannel 冲突')
 class ScannerBoxPlugin {
+  // 🔧 FIX: 恢复使用扫描器通道（扫描盒子本质上就是USB HID扫描器）
+  // 但不再独立调用 setMethodCallHandler，避免覆盖 BarcodeScannerService 的回调
   static const MethodChannel _channel = MethodChannel(
     'com.holox.ailand_pos/barcode_scanner',
   );
