@@ -140,6 +140,14 @@ class ScannerBoxService extends GetxService {
       // 调用扫描器服务扫描设备
       await _scannerService.scanUsbScanners();
       
+      // 打印原始数据
+      print('[ScannerBox] 扫描器服务返回设备数: ${_scannerService.detectedScanners.length}');
+      for (var scanner in _scannerService.detectedScanners) {
+        print('[ScannerBox] 原始设备: ${scanner.deviceName}');
+        print('  vendorId: ${scanner.vendorId} (0x${scanner.vendorId.toRadixString(16)})');
+        print('  productId: ${scanner.productId} (0x${scanner.productId.toRadixString(16)})');
+      }
+      
       // 转换为ScannerBoxDevice格式
       final devices = _scannerService.detectedScanners
           .map((scanner) => ScannerBoxDevice(
@@ -154,6 +162,14 @@ class ScannerBoxService extends GetxService {
                 isAuthorized: scanner.isConnected,
               ))
           .toList();
+      
+      // 打印转换后的数据
+      print('[ScannerBox] 转换后设备数: ${devices.length}');
+      for (var device in devices) {
+        print('[ScannerBox] 转换后设备: ${device.deviceName}');
+        print('  vendorId: ${device.vendorId} (0x${device.vendorId.toRadixString(16)})');
+        print('  productId: ${device.productId} (0x${device.productId.toRadixString(16)})');
+      }
       
       print('[ScannerBox] 扫描完成，发现 ${devices.length} 个设备');
       return devices;
